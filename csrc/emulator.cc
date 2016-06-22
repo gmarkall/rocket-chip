@@ -9,10 +9,113 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <boost/circular_buffer.hpp>
 
 #define MEM_SIZE_BITS 3
 #define MEM_LEN_BITS 8
 #define MEM_RESP_BITS 2
+
+/* In order to signal when start_trigger and stop_trigger are called, the BEEBS
+ * board support functions perform a specific sequence of instructions that the
+ * emulator watches out for. For the start_trigger function, it is:
+ *
+ * addi a0, a0, 0x45 ; 'E'
+ * addi a0, a0, 0x4D ; 'M'
+ * addi a0, a0, 0x42 ; 'B'
+ * addi a0, a0, 0x45 ; 'E'
+ *
+ * and for the stop_trigger function, it is:
+ *
+ * addi a0, a0, 0x43 ; 'C'
+ * addi a0, a0, 0x4F ; 'O'
+ * addi a0, a0, 0x53 ; 'S'
+ * addi a0, a0, 0x4D ; 'M'
+ *
+ * The MAGIC_STARTx and MAGIC_STOPx values are the encodings of these
+ * instructions.
+ */
+
+#define MAGIC_LEN 4
+
+#define MAGIC_START0 0x04550513
+#define MAGIC_START1 0x04d50513
+#define MAGIC_START2 0x04250513
+#define MAGIC_START3 0x04550513
+
+#define MAGIC_STOP0 0x04350513
+#define MAGIC_STOP1 0x04f50513
+#define MAGIC_STOP2 0x05350513
+#define MAGIC_STOP3 0x04d50513
+
+/* The MagicTracker keeps track of recently executed instructions, and watches
+ * for the magic sequences. The emulator can check with the MagicTracker to
+ * see if a magic sequence has just been encountered.
+ */
+
+class MagicTracker {
+private:
+  boost::circular_buffer<unsigned long> insts;
+  bool needs_reset;
+  bool needs_emit_cycle_count;
+
+public:
+  MagicTracker(): insts(MAGIC_LEN), needs_reset(false), needs_emit_cycle_count(false) {}
+
+  void nextInst(dat_t<32> inst) {
+    /* Only push the instruction into the buffer if there's none there yet,
+     * which happens at startup, or if this instruction differs from the one on
+     * the previous cycle (because instructions can take more than one cycle to
+     * retire (or commit, or something).
+     */
+    if (insts.empty() || inst.to_ulong() != insts.back()) {
+      insts.push_back(inst.to_ulong());
+
+      /* Check if we're at a magic point. We only do this when we push a new
+       * instruction (and not every cycle) because if the last instruction in
+       * the magic sequence stays current for several cycles, we will think
+       * we need to reset the counter or emit the cycle count for each of those
+       * cycles.
+       */
+
+      if ( insts[0] == MAGIC_START0
+        && insts[1] == MAGIC_START1
+        && insts[2] == MAGIC_START2
+        && insts[3] == MAGIC_START3)
+      {
+        needs_reset = true;
+      }
+
+      if ( insts[0] == MAGIC_STOP0
+        && insts[1] == MAGIC_STOP1
+        && insts[2] == MAGIC_STOP2
+        && insts[3] == MAGIC_STOP3)
+      {
+        needs_emit_cycle_count = true;
+      }
+    }
+  }
+
+  /* Functions for the emulator to check if we're at a magic point */
+
+  bool hitStart() {
+    if (needs_reset) {
+      needs_reset = false;
+      return true;
+    }
+
+    return false;
+  }
+
+  bool hitStop() {
+    if (needs_emit_cycle_count) {
+      needs_emit_cycle_count = false;
+      return true;
+    }
+
+    return false;
+  }
+
+};
 
 htif_emulator_t* htif;
 void handle_sigterm(int sig)
@@ -35,6 +138,7 @@ int main(int argc, char** argv)
   bool print_cycles = false;
   uint64_t memsz_mb = MEM_SIZE / (1024*1024);
   mm_t *mm[N_MEM_CHANNELS];
+  MagicTracker tracker;
 
   for (int i = 1; i < argc; i++)
   {
@@ -217,6 +321,20 @@ int main(int argc, char** argv)
 
     if (log && trace_count >= start)
       tile.print(stderr);
+
+    /* Added functionality to reset / emit cycle count if necessary */
+
+    tracker.nextInst(tile.getInst());
+    if (tracker.hitStart()) {
+      printf("Emulator: resetting cycle count\n");
+      trace_count = 0;
+    }
+
+    if (tracker.hitStop()) {
+      printf("Emulator: Cycle count is %d\n", trace_count);
+    }
+
+    /* End added functionality */
 
     // make sure we dump on cycle 0 to get dump_init
     if (vcd && (trace_count == 0 || trace_count >= start))
