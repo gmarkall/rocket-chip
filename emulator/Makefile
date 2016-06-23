@@ -63,7 +63,10 @@ clean:
 test:
 	cd $(base_dir) && $(SBT) "~make $(CURDIR) run-fast $(CHISEL_ARGS)"
 
-.PHONY: default all debug clean test
+install: $(emu)
+	cp $(emu) $(RISCV)/bin
+
+.PHONY: default all debug clean test install
 
 #--------------------------------------------------------------------
 # Run assembly tests and benchmarks
